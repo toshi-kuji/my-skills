@@ -40,6 +40,8 @@ gh skill update tk-structured-pdf
 
 `--scope project` installs into the current repository. `--scope user` installs into the user-scope skill directory for supported agent hosts, so it is available across projects in those hosts. When the source repository is large, prefer the exact path form such as `skills/tk-structured-pdf` instead of only the skill name.
 
+Prefer `--scope project` by default to avoid global skill pollution. Use `--scope user` only for skills you intentionally want available across multiple projects.
+
 Examples:
 
 - `skills/tk-structured-pdf`
