@@ -1,0 +1,4 @@
+interface:
+  display_name: "OCR"
+  short_description: "Convert PDFs and images to text"
+  default_prompt: "Use $ocr to OCR PDFs or images in a folder and write .txt outputs."
