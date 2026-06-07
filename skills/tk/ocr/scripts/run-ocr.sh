@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="${0:A:h}"
 CACHE_DIR="/private/tmp/codex-ocr-clang-module-cache"
 BINARY="/private/tmp/codex-ocr"
-TARGET="${1:-$PWD/tmp}"
 SOURCE="$SCRIPT_DIR/main.swift"
 
 mkdir -p "$CACHE_DIR"
@@ -23,4 +22,8 @@ if [[ ! -x "$BINARY" || "$SOURCE" -nt "$BINARY" ]]; then
     -framework ImageIO
 fi
 
-"$BINARY" "$TARGET"
+if [[ $# -eq 0 ]]; then
+  "$BINARY" "$PWD/tmp"
+else
+  "$BINARY" "$@"
+fi

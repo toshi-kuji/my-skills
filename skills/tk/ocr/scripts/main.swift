@@ -11,6 +11,17 @@ let preferredRecognitionLanguages = ["ja-JP", "en-US"]
 let pdfRenderScale: CGFloat = 2.5
 let maxRenderedPDFDimension: CGFloat = 5000
 
+let usage = """
+usage: run-ocr.sh [options] [file-or-folder ...]
+
+Options:
+  -r, --recursive      Process supported files under folders recursively.
+      --skip-existing  Do not overwrite existing non-empty .txt outputs.
+      --overwrite      Overwrite existing .txt outputs (default).
+      --report PATH    Write a TSV processing report.
+  -h, --help           Show this help.
+"""
+
 enum ExitCode: Int32 {
     case success = 0
     case partialFailure = 1
@@ -18,32 +29,36 @@ enum ExitCode: Int32 {
 }
 
 enum OCRToolError: Error, CustomStringConvertible {
-    case invalidArguments
-    case targetIsNotDirectory(String)
+    case invalidArguments(String)
+    case missingOptionValue(String)
+    case targetDoesNotExist(String)
+    case targetIsNotFileOrDirectory(String)
     case cannotListDirectory(String)
     case cannotOpenPDF(String)
     case cannotReadPDFPage(Int)
-    case cannotRenderPDFPage(Int)
     case cannotCreateBitmapContext(Int)
     case cannotCreateBitmapImage(Int)
     case cannotOpenImage(String)
     case cannotCreateImage(String)
     case unsupportedFile(String)
+    case pdftotextFailed(String)
 
     var description: String {
         switch self {
-        case .invalidArguments:
-            return "usage: run-ocr.sh [folder]"
-        case .targetIsNotDirectory(let path):
-            return "target is not a directory: \(path)"
+        case .invalidArguments(let message):
+            return "\(message)\n\(usage)"
+        case .missingOptionValue(let option):
+            return "missing value for \(option)\n\(usage)"
+        case .targetDoesNotExist(let path):
+            return "target does not exist: \(path)"
+        case .targetIsNotFileOrDirectory(let path):
+            return "target is not a file or directory: \(path)"
         case .cannotListDirectory(let path):
             return "could not list directory: \(path)"
         case .cannotOpenPDF(let path):
             return "could not open PDF: \(path)"
         case .cannotReadPDFPage(let index):
             return "could not read PDF page: \(index + 1)"
-        case .cannotRenderPDFPage(let index):
-            return "could not render PDF page: \(index + 1)"
         case .cannotCreateBitmapContext(let index):
             return "could not create bitmap context for PDF page: \(index + 1)"
         case .cannotCreateBitmapImage(let index):
@@ -54,8 +69,37 @@ enum OCRToolError: Error, CustomStringConvertible {
             return "could not create image: \(path)"
         case .unsupportedFile(let path):
             return "unsupported file type: \(path)"
+        case .pdftotextFailed(let message):
+            return "pdftotext fallback failed: \(message)"
         }
     }
+}
+
+struct Options {
+    var recursive = false
+    var skipExisting = false
+    var reportURL: URL?
+    var targets: [URL] = []
+}
+
+struct TargetFile {
+    let inputURL: URL
+    let outputURL: URL
+}
+
+struct Extraction {
+    let text: String
+    let method: String
+    let pages: Int
+}
+
+struct ReportRow {
+    let inputPath: String
+    let outputPath: String
+    let status: String
+    let method: String
+    let pages: String
+    let error: String
 }
 
 func failBeforeProcessing(_ error: Error) -> Never {
@@ -75,77 +119,185 @@ func errorMessage(_ error: Error) -> String {
     }
 
     let nsError = error as NSError
+    let base: String
     if nsError.domain != NSCocoaErrorDomain || nsError.code != 0 {
-        return "\(nsError.domain)(\(nsError.code)): \(nsError.localizedDescription)"
+        base = "\(nsError.domain)(\(nsError.code)): \(nsError.localizedDescription)"
+    } else {
+        base = String(describing: error)
     }
 
-    return String(describing: error)
+    if isLikelyVisionSandboxError(nsError: nsError, message: base) {
+        return "\(base) (Vision OCR may be blocked by the current sandbox; retry outside the sandbox.)"
+    }
+
+    return base
 }
 
-func resolveTargetDirectory(from arguments: [String]) throws -> URL {
-    guard arguments.count <= 1 else {
-        throw OCRToolError.invalidArguments
+func isLikelyVisionSandboxError(nsError: NSError, message: String) -> Bool {
+    if nsError.domain == "NSOSStatusErrorDomain", nsError.code == -6662 {
+        return true
     }
 
-    let rawPath = arguments.first ?? "/"
+    return message.contains("CVPixelBuffer") || message.contains("Foundation._GenericObjCError(0)")
+}
+
+func parseArguments(_ arguments: [String]) throws -> Options {
+    var options = Options()
+    var index = 0
+
+    while index < arguments.count {
+        let argument = arguments[index]
+
+        switch argument {
+        case "-h", "--help":
+            print(usage)
+            exit(ExitCode.success.rawValue)
+        case "-r", "--recursive":
+            options.recursive = true
+        case "--skip-existing":
+            options.skipExisting = true
+        case "--overwrite":
+            options.skipExisting = false
+        case "--report":
+            index += 1
+            guard index < arguments.count else {
+                throw OCRToolError.missingOptionValue(argument)
+            }
+            options.reportURL = resolveURL(arguments[index])
+        default:
+            if argument.hasPrefix("-") {
+                throw OCRToolError.invalidArguments("unknown option: \(argument)")
+            }
+            options.targets.append(resolveURL(argument))
+        }
+
+        index += 1
+    }
+
+    if options.targets.isEmpty {
+        options.targets = [resolveURL("\(FileManager.default.currentDirectoryPath)/tmp")]
+    }
+
+    return options
+}
+
+func resolveURL(_ rawPath: String) -> URL {
     let expandedPath = (rawPath as NSString).expandingTildeInPath
+    if expandedPath.hasPrefix("/") {
+        return URL(fileURLWithPath: expandedPath).standardizedFileURL
+    }
+
+    return URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        .appendingPathComponent(expandedPath)
+        .standardizedFileURL
+}
+
+func targetFiles(from targets: [URL], recursive: Bool) throws -> [TargetFile] {
+    var files: [TargetFile] = []
     let fileManager = FileManager.default
 
-    let url: URL
-    if expandedPath == "." {
-        url = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
-    } else if expandedPath.hasPrefix("/") {
-        url = URL(fileURLWithPath: expandedPath, isDirectory: true)
-    } else {
-        url = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(expandedPath, isDirectory: true)
+    for target in targets {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: target.path, isDirectory: &isDirectory) else {
+            throw OCRToolError.targetDoesNotExist(target.path)
+        }
+
+        if isDirectory.boolValue {
+            files.append(contentsOf: try targetFiles(in: target, recursive: recursive))
+            continue
+        }
+
+        guard isSupportedFile(target) else {
+            throw OCRToolError.unsupportedFile(target.path)
+        }
+
+        files.append(TargetFile(inputURL: target, outputURL: outputURL(for: target)))
     }
 
-    let standardizedURL = url.standardizedFileURL
-    var isDirectory: ObjCBool = false
-    guard fileManager.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
-          isDirectory.boolValue else {
-        throw OCRToolError.targetIsNotDirectory(standardizedURL.path)
+    return files.sorted {
+        $0.inputURL.path.localizedStandardCompare($1.inputURL.path) == .orderedAscending
     }
-
-    return standardizedURL
 }
 
-func targetFiles(in directory: URL) throws -> [URL] {
+func targetFiles(in directory: URL, recursive: Bool) throws -> [TargetFile] {
     let fileManager = FileManager.default
     let keys: [URLResourceKey] = [.isRegularFileKey]
+    var files: [URL] = []
 
-    let entries: [URL]
-    do {
-        entries = try fileManager.contentsOfDirectory(
+    if recursive {
+        guard let enumerator = fileManager.enumerator(
             at: directory,
             includingPropertiesForKeys: keys,
-            options: []
-        )
-    } catch {
-        throw OCRToolError.cannotListDirectory(directory.path)
+            options: [],
+            errorHandler: { url, _ in
+                writeStandardError("could not list directory entry: \(url.path)")
+                return true
+            }
+        ) else {
+            throw OCRToolError.cannotListDirectory(directory.path)
+        }
+
+        for case let url as URL in enumerator {
+            if isSupportedRegularFile(url, keys: keys) {
+                files.append(url.standardizedFileURL)
+            }
+        }
+    } else {
+        let entries: [URL]
+        do {
+            entries = try fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: keys,
+                options: []
+            )
+        } catch {
+            throw OCRToolError.cannotListDirectory(directory.path)
+        }
+
+        files = entries
+            .filter { isSupportedRegularFile($0, keys: keys) }
+            .map { $0.standardizedFileURL }
     }
 
-    return entries
-        .filter { url in
-            let values = try? url.resourceValues(forKeys: Set(keys))
-            guard values?.isRegularFile == true else {
-                return false
-            }
+    return files.map { TargetFile(inputURL: $0, outputURL: outputURL(for: $0)) }
+}
 
-            return supportedExtensions.contains(url.pathExtension.lowercased())
-        }
-        .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+func isSupportedRegularFile(_ url: URL, keys: [URLResourceKey]) -> Bool {
+    let values = try? url.resourceValues(forKeys: Set(keys))
+    guard values?.isRegularFile == true else {
+        return false
+    }
+
+    return isSupportedFile(url)
+}
+
+func isSupportedFile(_ url: URL) -> Bool {
+    supportedExtensions.contains(url.pathExtension.lowercased())
 }
 
 func outputURL(for inputURL: URL) -> URL {
     inputURL.deletingPathExtension().appendingPathExtension("txt")
 }
 
-func extractText(from fileURL: URL) throws -> String {
+func hasExistingOutput(_ url: URL) -> Bool {
+    guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]) else {
+        return false
+    }
+
+    return values.isRegularFile == true && (values.fileSize ?? 0) > 0
+}
+
+func extractText(from fileURL: URL) throws -> Extraction {
     switch fileURL.pathExtension.lowercased() {
     case "pdf":
-        return try extractTextFromPDF(fileURL)
+        do {
+            return try extractTextFromPDF(fileURL)
+        } catch {
+            if let fallback = try? extractTextWithPDFToText(fileURL), !fallback.text.isEmpty {
+                return fallback
+            }
+            throw error
+        }
     case "jpg", "jpeg", "png":
         return try extractTextFromImage(fileURL)
     default:
@@ -153,7 +305,7 @@ func extractText(from fileURL: URL) throws -> String {
     }
 }
 
-func extractTextFromImage(_ fileURL: URL) throws -> String {
+func extractTextFromImage(_ fileURL: URL) throws -> Extraction {
     guard let source = CGImageSourceCreateWithURL(fileURL as CFURL, nil) else {
         throw OCRToolError.cannotOpenImage(fileURL.path)
     }
@@ -165,20 +317,24 @@ func extractTextFromImage(_ fileURL: URL) throws -> String {
         throw OCRToolError.cannotCreateImage(fileURL.path)
     }
 
-    return try recognizeText(in: image, orientation: orientation)
+    let normalizedImage = try normalizedRGBImage(from: image)
+    let text = try recognizeText(in: normalizedImage, orientation: orientation)
+    return Extraction(text: text, method: "vision", pages: 1)
 }
 
-func extractTextFromPDF(_ fileURL: URL) throws -> String {
+func extractTextFromPDF(_ fileURL: URL) throws -> Extraction {
     guard let document = PDFDocument(url: fileURL) else {
         throw OCRToolError.cannotOpenPDF(fileURL.path)
     }
 
     guard document.pageCount > 0 else {
-        return ""
+        return Extraction(text: "", method: "empty-pdf", pages: 0)
     }
 
     var pageTexts: [String] = []
     pageTexts.reserveCapacity(document.pageCount)
+    var usedVision = false
+    var usedPDFKitText = false
 
     for index in 0..<document.pageCount {
         print("  page \(index + 1)/\(document.pageCount)")
@@ -191,10 +347,12 @@ func extractTextFromPDF(_ fileURL: URL) throws -> String {
         do {
             let image = try renderPDFPage(page, index: index)
             let recognizedText = try recognizeText(in: image, orientation: .up)
+            usedVision = true
             pageTexts.append(recognizedText)
         } catch {
             if let fallbackText = page.string?.trimmingCharacters(in: .whitespacesAndNewlines),
                !fallbackText.isEmpty {
+                usedPDFKitText = true
                 pageTexts.append(fallbackText)
             } else {
                 throw error
@@ -202,7 +360,51 @@ func extractTextFromPDF(_ fileURL: URL) throws -> String {
         }
     }
 
-    return pageTexts.joined(separator: "\n\n")
+    let method: String
+    switch (usedVision, usedPDFKitText) {
+    case (true, true):
+        method = "vision+pdfkit-text"
+    case (true, false):
+        method = "vision"
+    case (false, true):
+        method = "pdfkit-text"
+    case (false, false):
+        method = "empty-pdf"
+    }
+
+    return Extraction(text: pageTexts.joined(separator: "\n\n"), method: method, pages: document.pageCount)
+}
+
+func extractTextWithPDFToText(_ fileURL: URL) throws -> Extraction {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["pdftotext", "-enc", "UTF-8", "-layout", fileURL.path, "-"]
+
+    let outputPipe = Pipe()
+    let errorPipe = Pipe()
+    process.standardOutput = outputPipe
+    process.standardError = errorPipe
+
+    do {
+        try process.run()
+    } catch {
+        throw OCRToolError.pdftotextFailed(error.localizedDescription)
+    }
+
+    process.waitUntilExit()
+
+    let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+    let outputText = String(data: outputData, encoding: .utf8) ?? ""
+    let errorText = String(data: errorData, encoding: .utf8) ?? ""
+
+    guard process.terminationStatus == 0 else {
+        let message = errorText.trimmingCharacters(in: .whitespacesAndNewlines)
+        throw OCRToolError.pdftotextFailed(message.isEmpty ? "exit \(process.terminationStatus)" : message)
+    }
+
+    let pages = PDFDocument(url: fileURL)?.pageCount ?? 0
+    return Extraction(text: outputText, method: "pdftotext", pages: pages)
 }
 
 func renderPDFPage(_ page: PDFPage, index: Int) throws -> CGImage {
@@ -242,6 +444,33 @@ func renderPDFPage(_ page: PDFPage, index: Int) throws -> CGImage {
     return image
 }
 
+func normalizedRGBImage(from image: CGImage) throws -> CGImage {
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+
+    guard let context = CGContext(
+        data: nil,
+        width: image.width,
+        height: image.height,
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: colorSpace,
+        bitmapInfo: bitmapInfo
+    ) else {
+        throw OCRToolError.cannotCreateImage("normalized bitmap")
+    }
+
+    context.setFillColor(NSColor.white.cgColor)
+    context.fill(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+
+    guard let normalizedImage = context.makeImage() else {
+        throw OCRToolError.cannotCreateImage("normalized image")
+    }
+
+    return normalizedImage
+}
+
 func imageOrientation(from properties: [CFString: Any]?) -> CGImagePropertyOrientation {
     guard let number = properties?[kCGImagePropertyOrientation] as? NSNumber,
           let orientation = CGImagePropertyOrientation(rawValue: number.uint32Value) else {
@@ -276,31 +505,94 @@ func writeText(_ text: String, to url: URL) throws {
     try output.write(to: url, atomically: true, encoding: .utf8)
 }
 
-func run() throws -> ExitCode {
-    let targetDirectory = try resolveTargetDirectory(from: Array(CommandLine.arguments.dropFirst()))
-    let files = try targetFiles(in: targetDirectory)
+func writeReport(_ rows: [ReportRow], to reportURL: URL) throws {
+    let parentURL = reportURL.deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: parentURL, withIntermediateDirectories: true)
 
-    print("Scanning: \(targetDirectory.path)")
+    let header = "input\toutput\tstatus\tmethod\tpages\terror"
+    let body = rows.map { row in
+        [
+            tsv(row.inputPath),
+            tsv(row.outputPath),
+            tsv(row.status),
+            tsv(row.method),
+            tsv(row.pages),
+            tsv(row.error)
+        ].joined(separator: "\t")
+    }
+
+    try ([header] + body).joined(separator: "\n").appending("\n")
+        .write(to: reportURL, atomically: true, encoding: .utf8)
+}
+
+func tsv(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "\t", with: " ")
+        .replacingOccurrences(of: "\r", with: " ")
+        .replacingOccurrences(of: "\n", with: " ")
+}
+
+func run() throws -> ExitCode {
+    let options = try parseArguments(Array(CommandLine.arguments.dropFirst()))
+    let files = try targetFiles(from: options.targets, recursive: options.recursive)
+
+    print("Scanning: \(options.targets.map { $0.path }.joined(separator: ", "))")
     print("Found: \(files.count) file(s)")
 
     var successCount = 0
     var failureCount = 0
+    var skippedCount = 0
+    var reportRows: [ReportRow] = []
 
-    for fileURL in files {
-        let outputFileURL = outputURL(for: fileURL)
+    for file in files {
+        if options.skipExisting && hasExistingOutput(file.outputURL) {
+            skippedCount += 1
+            print("[SKIP] \(file.inputURL.lastPathComponent) -> \(file.outputURL.lastPathComponent)")
+            reportRows.append(ReportRow(
+                inputPath: file.inputURL.path,
+                outputPath: file.outputURL.path,
+                status: "skip",
+                method: "",
+                pages: "",
+                error: ""
+            ))
+            continue
+        }
 
         do {
-            let text = try extractText(from: fileURL)
-            try writeText(text, to: outputFileURL)
+            let extraction = try extractText(from: file.inputURL)
+            try writeText(extraction.text, to: file.outputURL)
             successCount += 1
-            print("[OK] \(fileURL.lastPathComponent) -> \(outputFileURL.lastPathComponent)")
+            print("[OK] \(file.inputURL.lastPathComponent) -> \(file.outputURL.lastPathComponent) [\(extraction.method)]")
+            reportRows.append(ReportRow(
+                inputPath: file.inputURL.path,
+                outputPath: file.outputURL.path,
+                status: "ok",
+                method: extraction.method,
+                pages: "\(extraction.pages)",
+                error: ""
+            ))
         } catch {
+            let message = errorMessage(error)
             failureCount += 1
-            print("[FAIL] \(fileURL.lastPathComponent): \(errorMessage(error))")
+            print("[FAIL] \(file.inputURL.lastPathComponent): \(message)")
+            reportRows.append(ReportRow(
+                inputPath: file.inputURL.path,
+                outputPath: file.outputURL.path,
+                status: "fail",
+                method: "",
+                pages: "",
+                error: message
+            ))
         }
     }
 
-    print("Done. success=\(successCount) failed=\(failureCount)")
+    if let reportURL = options.reportURL {
+        try writeReport(reportRows, to: reportURL)
+        print("Report: \(reportURL.path)")
+    }
+
+    print("Done. success=\(successCount) skipped=\(skippedCount) failed=\(failureCount)")
 
     return failureCount == 0 ? .success : .partialFailure
 }
