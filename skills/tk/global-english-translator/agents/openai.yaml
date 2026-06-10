@@ -1,0 +1,4 @@
+interface:
+  display_name: "Global English Translator"
+  short_description: "Global-clear Japanese to English translation"
+  default_prompt: "Use $global-english-translator to translate this Japanese into clear, globally understandable English matched to my level."
