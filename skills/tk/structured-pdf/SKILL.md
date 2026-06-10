@@ -22,7 +22,7 @@ Use Pandoc to preserve semantic Markdown structure and WeasyPrint to render tagg
 ```bash
 pandoc input.md \
   --from markdown+fenced_divs-smart \
-  --template skills/tk-structured-pdf/templates/no-title.html \
+  --template skills/tk/structured-pdf/templates/no-title.html \
   --standalone \
   --css generated-or-user.css \
   --metadata title="Document Title" \
@@ -36,7 +36,7 @@ pandoc input.md \
 Use the bundled helper script for repeatable output:
 
 ```bash
-skills/tk-structured-pdf/scripts/render_pdf_ua.sh input.md output.pdf "Document Title" \
+skills/tk/structured-pdf/scripts/render_pdf_ua.sh input.md output.pdf "Document Title" \
   --paper Letter \
   --margins "0.66in 0.72in 0.62in 0.72in" \
   --page-numbers none
