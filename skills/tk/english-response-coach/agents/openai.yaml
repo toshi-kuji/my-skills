@@ -1,0 +1,4 @@
+interface:
+  display_name: "English Response Coach"
+  short_description: "Answer first, then advanced English coaching"
+  default_prompt: "Use $english-response-coach to answer my English prompt first, then append English-only notes on my prompt and useful C1/C1+ vocabulary, idioms, and American English nuance from your answer."
