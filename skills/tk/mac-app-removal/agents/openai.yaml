@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mac App Removal"
+  short_description: "Safely uninstall macOS apps and large data"
+  default_prompt: "Use $mac-app-removal to safely uninstall a macOS app and related support files."
