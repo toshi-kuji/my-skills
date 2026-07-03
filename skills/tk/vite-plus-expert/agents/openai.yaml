@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vite+ Expert"
+  short_description: "Specialist guardrails for Vite+ work"
+  default_prompt: "Use $vite-plus-expert to help with this Vite+ task without confusing it with ordinary Vite."
